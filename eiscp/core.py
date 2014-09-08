@@ -32,8 +32,8 @@ class ISCPMessage(object):
     @classmethod
     def parse(self, data):
         EOF = '\x1a'
-        assert data[:2] == '!1'
-        assert data[-1] in [EOF, '\n', '\r']
+        if not (data[:2] == '!1'): raise ValueError
+        if not (data[-1] in [EOF, '\n', '\r']): raise ValueError
         return data[2:-3]
 
 
@@ -250,6 +250,8 @@ def filter_for_message(getter_func, msg):
         if time.time() - start > 5.0:
             raise ValueError('Timeout waiting for response.')
 
+import serial
+
 
 class eISCP(object):
     """Implements the eISCP interface to Onkyo receivers.
@@ -409,6 +411,127 @@ class eISCP(object):
     def power_off(self):
         """Turn the receiver power off."""
         return self.command('power', 'off')
+
+
+class ISCP(eISCP):
+    """Implements the eISCP interface to Onkyo receivers.
+
+    This uses a blocking interface. The remote end will regularily
+    send unsolicited status updates. You need to manually call
+    ``get_message`` to query those.
+
+    You may want to look at the :meth:`Receiver` class instead, which
+    uses a background thread.
+    """
+
+    @classmethod
+    def discover(cls, timeout=5, clazz=None):
+        """Try to find ISCP devices.
+
+        Waits for ``timeout`` seconds, then returns all devices found,
+        in form of a list of dicts.
+        """
+        onkyo_magic = str(ISCPMessage('ECNQSTN'))
+
+        from serial.tools import list_ports
+
+        found_receivers = []
+        for port in list_ports.comports():
+            with ISCP(port[0]) as device:
+                response = device.raw(onkyo_magic)
+                if response:
+
+                    # Return string looks something like this:
+                    # !1ECNTX-NR609/60128/DX
+                    info = re.match(r'''
+                        !
+                        (?P<device_category>\d)
+                        ECN
+                        (?P<model_name>[^/]*)/
+                        (?P<iscp_port>\d{5})/
+                        (?P<area_code>\w{2})/
+                        (?P<identifier>.{0,12})
+                    ''', response.strip(), re.VERBOSE).groupdict()
+
+                    # Give the user a ready-made receiver instance. It will only
+                    # connect on demand, when actually used.
+                    receiver = (clazz or eISCP)(addr[0], int(info['iscp_port']))
+                    receiver.info = info
+                    found_receivers.append(receiver)
+
+        return found_receivers
+
+    def __init__(self, device_name):
+        self.device_name = device_name
+
+        self.device = None
+
+    def __repr__(self):
+        if getattr(self, 'info', False) and self.info.get('model_name'):
+            model = self.info['model_name']
+        else:
+            model = 'unknown'
+        string = "<%s(%s) %s:%s>" % (
+            self.__class__.__name__, model, self.device_name)
+        return string
+
+    def _ensure_socket_connected(self):
+        if self.device is None:
+            self.device = serial.Serial(port=self.device_name,
+                                        baudrate=9600,
+                                        bytesize=serial.EIGHTBITS,
+                                        parity=serial.PARITY_NONE,
+                                        stopbits=serial.STOPBITS_ONE,
+                                        rtscts=False,
+                                        timeout=0   # Non-blocking
+                                        )
+
+    def disconnect(self):
+        try:
+            self.device.close()
+        except:
+            pass
+        self.device = None
+
+    def __enter__(self):
+        self._ensure_socket_connected()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+
+    def send(self, iscp_message):
+        """Send a low-level ISCP message, like ``MVL50``.
+
+        This does not return anything, nor does it wait for a response
+        from the receiver. You can query responses via :meth:`get`,
+        or use :meth:`raw` to send a message and waiting for one.
+        """
+        self._ensure_socket_connected()
+        self.device.write(str(iscp_message))
+
+    def get(self, timeout=0.1):
+        """Return the next message sent by the receiver, or, after
+        ``timeout`` has passed, return ``None``.
+        """
+        self._ensure_socket_connected()
+
+        message_received = False
+        ser_input = ''
+
+        while not message_received:
+            ready = select.select([self.device], [], [], timeout or 0)
+            if ready[0]:
+                ser_input += self.device.read(1)
+                try:
+                    result = ISCPMessage.parse(ser_input)
+                except ValueError:
+                    pass
+                else:
+                    message_received = True
+                    return result
+            else:
+                return None
 
 
 class Receiver(eISCP):
