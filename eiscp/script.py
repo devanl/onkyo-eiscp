@@ -1,7 +1,7 @@
 '''Control Onkyo A/V receivers.
 
 Usage:
-  %(program_name)s [--host <host>] [--port <port>] [--all] [--name <name>]
+  %(program_name)s [--com <device>] [--host <host>] [--port <port>] [--all] [--name <name>]
                    <command>...
   %(program_name)s --discover
   %(program_name)s --help-commands [<zone> <command>]
@@ -9,6 +9,7 @@ Usage:
 
 Selecting the receiver:
 
+  --com, -c <device>    Connect to com port
   --host, -t <host>     Connect to this host
   --port, -p <port>     Connect to this port [default: 60128]
   --all, -a             Discover receivers, send to all found
@@ -31,7 +32,7 @@ import sys
 import os
 import docopt
 
-from core import eISCP, command_to_iscp, iscp_to_command
+from core import ISCP, eISCP, command_to_iscp, iscp_to_command
 import commands
 
 # Automatically replace %(program_name)s with the current program name in the
@@ -46,8 +47,11 @@ def main(argv=sys.argv):
     # List commands
     if options['--discover']:
         for receiver in eISCP.discover(timeout=1):
-            print '%s %s:%s' % (
-                receiver.info['model_name'], receiver.host, receiver.port)
+            print '%r' % (
+                receiver,)
+        for receiver in ISCP.discover(timeout=1):
+            print '%r' % (
+                receiver,)
         return
 
     # List available commands
@@ -86,10 +90,13 @@ def main(argv=sys.argv):
         return
 
     # Determine the receivers the command should run on
-    if options['--host']:
+    if options['--com']:
+        receivers = [ISCP(options['--com'])]
+    elif options['--host']:
         receivers = [eISCP(options['--host'], int(options['--port']))]
     else:
         receivers = eISCP.discover(timeout=1)
+        receivers.extend(ISCP.discover(timeout=1))
         if not options['--all']:
             if options['--name']:
                 receivers = [r for r in receivers
@@ -119,10 +126,14 @@ def main(argv=sys.argv):
                     raw_response = False
 
                 print '%s: %s' % (receiver, iscp_command)
-                response = receiver.raw(iscp_command)
-                if not raw_response:
-                    response = iscp_to_command(response)
-                print response
+                try:
+                    response = receiver.raw(iscp_command)
+                except ValueError as e:
+                    print e.message
+                else:
+                    if not raw_response:
+                        response = iscp_to_command(response)
+                    print response
 
 
 def run():

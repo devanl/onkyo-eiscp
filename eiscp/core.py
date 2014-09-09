@@ -231,7 +231,7 @@ def iscp_to_command(iscp_message):
             'Cannot convert ISCP message to command: %s' % iscp_message)
 
 
-def filter_for_message(getter_func, msg):
+def filter_for_message(getter_func, msg, timeout=5.0):
     """Helper that calls ``getter_func`` until a matching message
     is found, or the timeout occurs. Matching means the same commands
     group, i.e. for sent message MVLUP we would accept MVL13
@@ -239,6 +239,7 @@ def filter_for_message(getter_func, msg):
     start = time.time()
     while True:
         candidate = getter_func(0.05)
+        # print 'Candidate is %r' % (candidate,)
         # It seems ISCP commands are always three characters.
         if candidate and candidate[:3] == msg[:3]:
             return candidate
@@ -247,7 +248,7 @@ def filter_for_message(getter_func, msg):
         # however, the interval needed to be at least 200ms before
         # I managed to see any response, and only after 300ms
         # reproducably, so use a generous timeout.
-        if time.time() - start > 5.0:
+        if time.time() - start > timeout:
             raise ValueError('Timeout waiting for response.')
 
 import serial
@@ -361,15 +362,17 @@ class eISCP(object):
         ``timeout`` has passed, return ``None``.
         """
         self._ensure_socket_connected()
-
+        # print 'get'
         ready = select.select([self.command_socket], [], [], timeout or 0)
         if ready[0]:
             header_bytes = self.command_socket.recv(16)
             header = eISCPPacket.parse_header(header_bytes)
             message = self.command_socket.recv(header.data_size)
             return ISCPMessage.parse(message)
+            # print 'got %s' % (message,)
+        # print 'got nothing'
 
-    def raw(self, iscp_message):
+    def raw(self, iscp_message, timeout=5.0):
         """Send a low-level ISCP message, like ``MVL50``, and wait
         for a response.
 
@@ -390,7 +393,7 @@ class eISCP(object):
             # response to our sent command later.
             pass
         self.send(iscp_message)
-        return filter_for_message(self.get, iscp_message)
+        return filter_for_message(self.get, iscp_message, timeout=timeout)
 
     def command(self, command, arguments=None, zone=None):
         """Send a high-level command to the receiver, return the
@@ -425,39 +428,46 @@ class ISCP(eISCP):
     """
 
     @classmethod
-    def discover(cls, timeout=5, clazz=None):
+    def discover(cls, timeout=5.0, clazz=None):
         """Try to find ISCP devices.
 
         Waits for ``timeout`` seconds, then returns all devices found,
         in form of a list of dicts.
         """
-        onkyo_magic = str(ISCPMessage('ECNQSTN'))
+        onkyo_magic = 'PWRQSTN'   #  Serial receivers may not respond to magic inquiry
 
         from serial.tools import list_ports
 
         found_receivers = []
         for port in list_ports.comports():
             with ISCP(port[0]) as device:
-                response = device.raw(onkyo_magic)
-                if response:
+                try:
+                    response = device.raw(onkyo_magic, timeout=timeout)
+                except ValueError:
+                    # print 'No response on %r' % (port,)
+                    pass
+                else:
+                    if response:
 
-                    # Return string looks something like this:
-                    # !1ECNTX-NR609/60128/DX
-                    info = re.match(r'''
-                        !
-                        (?P<device_category>\d)
-                        ECN
-                        (?P<model_name>[^/]*)/
-                        (?P<iscp_port>\d{5})/
-                        (?P<area_code>\w{2})/
-                        (?P<identifier>.{0,12})
-                    ''', response.strip(), re.VERBOSE).groupdict()
+                        # print 'Found receiver on %r' % (port,)
 
-                    # Give the user a ready-made receiver instance. It will only
-                    # connect on demand, when actually used.
-                    receiver = (clazz or eISCP)(addr[0], int(info['iscp_port']))
-                    receiver.info = info
-                    found_receivers.append(receiver)
+                        # Return string looks something like this:
+                        # !1ECNTX-NR609/60128/DX
+                        # info = re.match(r'''
+                        #     !
+                        #     (?P<device_category>\d)
+                        #     ECN
+                        #     (?P<model_name>[^/]*)/
+                        #     (?P<iscp_port>\d{5})/
+                        #     (?P<area_code>\w{2})/
+                        #     (?P<identifier>.{0,12})
+                        # ''', response.strip(), re.VERBOSE).groupdict()
+
+                        # Give the user a ready-made receiver instance. It will only
+                        # connect on demand, when actually used.
+                        receiver = (clazz or ISCP)(port[0])
+                        # receiver.info = {'model_name' : 'Serial Device'}
+                        found_receivers.append(receiver)
 
         return found_receivers
 
@@ -471,7 +481,7 @@ class ISCP(eISCP):
             model = self.info['model_name']
         else:
             model = 'unknown'
-        string = "<%s(%s) %s:%s>" % (
+        string = "<%s(%s) %s>" % (
             self.__class__.__name__, model, self.device_name)
         return string
 
@@ -508,7 +518,25 @@ class ISCP(eISCP):
         or use :meth:`raw` to send a message and waiting for one.
         """
         self._ensure_socket_connected()
-        self.device.write(str(iscp_message))
+        # print 'Sending %s' % (ISCPMessage(iscp_message),)
+        self.device.write(str(ISCPMessage(iscp_message)))
+
+    import threading
+    class Timeout(object):
+        def __init__(self, duration):
+            self.timer = threading.Timer(duration, self.__timer_func)
+            self.timer.start()
+            self.__timeout = False
+
+        def __del__(self):
+            self.timer.cancel()
+
+        @property
+        def expired(self):
+            return self.timer.finished.isSet()
+
+        def __timer_func(self):
+            self.__timeout = True
 
     def get(self, timeout=0.1):
         """Return the next message sent by the receiver, or, after
@@ -519,19 +547,22 @@ class ISCP(eISCP):
         message_received = False
         ser_input = ''
 
-        while not message_received:
-            ready = select.select([self.device], [], [], timeout or 0)
-            if ready[0]:
+        t = self.Timeout(timeout)
+
+        while not t.expired:
+            ready = self.device.inWaiting()
+            if ready > 0:
                 ser_input += self.device.read(1)
                 try:
                     result = ISCPMessage.parse(ser_input)
                 except ValueError:
                     pass
                 else:
+                    # print "Got %r" % (ser_input,)
                     message_received = True
                     return result
-            else:
-                return None
+
+        # print 'get() Timeout'
 
 
 class Receiver(eISCP):
