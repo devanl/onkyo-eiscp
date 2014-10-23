@@ -29,12 +29,24 @@ class ISCPMessage(object):
         # End character may be CR, LF or CR+LF, according to doc
         return '!1%s\r' % self.data
 
+    @property
+    def command(self):
+        return self.data[:3]
+
+
+    @property
+    def parameters(self):
+        if len(data) > 3:
+            return self.data[3:-1]
+        else:
+            return ''
+
     @classmethod
     def parse(self, data):
         EOF = '\x1a'
         if not (data[:2] == '!1'): raise ValueError
         if not (data[-1] in [EOF, '\n', '\r']): raise ValueError
-        return data[2:-3]
+        return data[2:-1]
 
 
 class eISCPPacket(object):
@@ -216,15 +228,15 @@ def iscp_to_command(iscp_message):
         command, args = iscp_message[:3], iscp_message[3:]
         if command in zone_cmds:
             if args in zone_cmds[command]['values']:
-                return zone_cmds[command]['name'], \
+                return zone, zone_cmds[command]['name'], \
                        zone_cmds[command]['values'][args]['name']
             else:
                 match = re.match('[+-]?[0-9a-f]$', args, re.IGNORECASE)
                 if match:
-                    return zone_cmds[command]['name'], \
+                    return zone, zone_cmds[command]['name'], \
                              int(args, 16)
                 else:
-                    return zone_cmds[command]['name'], args
+                    return zone, zone_cmds[command]['name'], args
 
     else:
         raise ValueError(
@@ -242,6 +254,7 @@ def filter_for_message(getter_func, msg, timeout=5.0):
         # print 'Candidate is %r' % (candidate,)
         # It seems ISCP commands are always three characters.
         if candidate and candidate[:3] == msg[:3]:
+            # print 'candidate is %r' % (candidate,)
             return candidate
         # The protocol docs claim that a response  should arrive
         # within *50ms or the communication has failed*. In my tests,

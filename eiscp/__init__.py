@@ -3,4 +3,4 @@
 
 __author__ = 'Michael Elsdoerfer <michael@elsdoerfer.com>'
 
-from core import eISCP
+from core import eISCP, ISCP, command_to_iscp, iscp_to_command
